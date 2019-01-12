@@ -1,0 +1,246 @@
+#!/bin/bash
+
+# MIT licenced
+# Copyright (c) 2019 Olivier Favre
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# FIXME: To run a simple "echo $HOSTNAME" command we have to use sh -c in a twisted way in order to escape sufficiently
+#     tmk POD -- sh -c "'echo" "\\\$HOSTNAME'"
+
+T_DEFAULT=on # on/off
+I_DEFAULT=on # on/off
+
+usage() {
+    cat << EOF
+Usage: $(basename "$0") [TMUX-OPTIONS]
+       $(basename "$0" | sed 's/./ /g') [KUBECTL-OPTIONS] [-n NAMESPACE] [-c CONTAINER] POD[/CONTAINER] [...]
+       $(basename "$0" | sed 's/./ /g') [-- COMMAND [args...]]
+
+Run a tmux session with one panel per matched Kubernetes pod, side by side.
+
+Tmux options:
+    -h, --help      Display help message and quit.
+    -l LAYOUT       Select a tmux layout.
+    -H              Use even-horizontal tmux layout.
+    -V              Use even-vertical tmux layout.
+
+Kubectl exec options:
+    -t/+t           Activates/Deactivates stdin as a TTY. (default $T_DEFAULT)
+    -i/+i           Activates/Deactivates stdin forwarding. (default $I_DEFAULT)
+    -n NAMESPACE    The namespace to use.
+    -c CONTAINER    Specifies the default container to use unless overridden using the POD/CONTAINER syntax.
+                    The first container of the pod is chosen by default.
+    POD             The pod inside which the command is to be executed.
+                    Can use "?" to add a single alphanumeric group.
+                    Can use "*" to add any number of dash-separated alphanumeric groups.
+                    Examples:
+                        app-0 will match only app-0.
+                        app-? will match app-0 and app-abcde.
+                        app-* will match app-abcde and app-abc-def.
+                        app-?-0 will match app-one-0 and app-two-0.
+    COMMAND         By default, runs "sh".
+EOF
+}
+
+DASHDASH=""
+LAYOUT="tiled"
+COMMAND=()
+T="$T_DEFAULT"
+I="$I_DEFAULT"
+NAMESPACE=""
+PODS=()
+CONTAINER=""
+
+while [ $# -gt 0 ]; do
+	if [ "$DASHDASH" = "seen" ]; then
+		COMMAND+=("$1")
+	else
+		case "$1" in
+			-h|--help)
+				usage
+				exit 0
+				;;
+			-l)
+				LAYOUT="$2"
+				shift
+				;;
+			-H)
+				LAYOUT="even-horizontal"
+				;;
+			-V)
+				LAYOUT="even-vertical"
+				;;
+			-t)
+				T="on"
+				;;
+			+t)
+				T="off"
+				;;
+			-i)
+				I="on"
+				;;
+			+i)
+				I="off"
+				;;
+			-n)
+				NAMESPACE="$2"
+				shift
+				;;
+			-c)
+				CONTAINER="$2"
+				shift
+				;;
+			--)
+				DASHDASH=seen
+				;;
+			-*)
+				echo "Unknown option $1" >&2
+				exit 1
+				;;
+			*)
+				PODS+=("$1")
+				;;
+		esac
+	fi
+	shift
+done
+
+if [ "${#PODS[@]}" -eq 0 ]; then
+	echo "Missing pods" >&2
+	exit 1
+fi
+
+if [ "${#COMMAND[@]}" -eq 0 ]; then
+	if [ "$DASHDASH" = "seen" ]; then
+		echo "Missing command" >&2
+		exit 1
+	else
+		COMMAND=("sh")
+	fi
+fi
+
+#echo "DASHDASH=$DASHDASH"
+#echo "LAYOUT=$LAYOUT"
+#echo "COMMAND=(${#COMMAND[@]}) ${COMMAND[@]}"
+#echo "T=$T"
+#echo "I=$I"
+#echo "NAMESPACE=$NAMESPACE"
+#echo "PODS=${PODS[@]}"
+#echo "CONTAINER=$CONTAINER"
+#exit
+
+K8S_T_OPT=""
+if [ "$T" = "on" ]; then
+	K8S_T_OPT="-t"
+fi
+K8S_I_OPT=""
+if [ "$I" = "on" ]; then
+	K8S_I_OPT="-i"
+fi
+
+K8S_NAMESPACE_OPT=""
+if [ "$NAMESPACE" = "*" ]; then
+	K8S_NAMESPACE_OPT="--all-namespaces"
+elif [ -n "$NAMESPACE" ]; then
+	K8S_NAMESPACE_OPT="-n $NAMESPACE"
+fi
+
+# check if tmux is in PATH
+if [ -z "$(which tmux)" ]; then
+    echo "error: tmux not found in path: $PATH" 1>&2
+    exit 1
+fi
+
+SESSION_NAME="tmk-$NAMESPACE-$POD-$CONTAINER-$(date +%Y%m%dT%H%M%S)"
+TMUX_SESSION_S_ARG="-s \"$SESSION_NAME\""
+TMUX_SESSION_T_ARG="-t \"$SESSION_NAME\""
+
+POD_PATTERNS=()
+for pattern_line in "${PODS[@]}"; do
+	pattern="${pattern_line%/*}"
+	if [ "$pattern" = "$pattern_line" ]; then
+		append=""
+	else
+		append="/${pattern_line##*/}"
+	fi
+	# Replace first ? and * with illegal characters that we won't use in replacement
+	# This avoids breaking the replacement that has just been made
+	pattern="${pattern//\?/~}"
+	pattern="${pattern//\*/%}"
+	pattern="${pattern//~/[[:alnum:]]+}"
+	pattern="${pattern//%/([[:alnum:]][-[:alnum:]]*)?[[:alnum:]]}"
+	POD_PATTERNS+=("$pattern$append")
+done
+
+ELIGIBLE_PODS="$(kubectl get pods $K8S_NAMESPACE_OPT --output=jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+ACTUAL_PODS=()
+for regex_line in "${POD_PATTERNS[@]}"; do
+	regex="${regex_line%/*}"
+	if [ "$regex" = "$regex_line" ]; then
+		append=""
+	else
+		append="/${regex_line##*/}"
+	fi
+	while read pod; do
+		ACTUAL_PODS+=("$pod$append")
+	done < <(echo "$ELIGIBLE_PODS" | grep -E -e "^$regex\$")
+done
+
+CMDS=() # actual kubectl exec commands to execute
+for pod_line in "${ACTUAL_PODS[@]}"; do
+	pod="${pod_line%/*}"
+	if [ "$pod" = "$pod_line" ]; then
+		container="$CONTAINER"
+	else
+		container="${pod_line##*/}"
+	fi
+	if [ -n "$container" ]; then
+		K8S_CONTAINER_OPT="-c $container"
+	else
+		K8S_CONTAINER_OPT=""
+	fi
+	# TODO Escape space in arguments
+	CMDS+=("kubectl exec $K8S_NAMESPACE_OPT $pod $K8S_CONTAINER_OPT $K8S_T_OPT $K8S_I_OPT -- ${COMMAND[*]}")
+done
+
+TMUX_CMDS=()
+for cmd in "${CMDS[@]}"; do
+	# TODO Escape characters for use within double-quotes
+	SHELL_CMD="($cmd); (echo; echo -n Press ENTER to close pane; read enter)"
+	if [ "${#TMUX_CMDS[@]}" -eq 0 ]; then
+		TMUX_CMDS+=("new -d $TMUX_SESSION_S_ARG \"$SHELL_CMD\"")
+	else
+		TMUX_CMDS+=("splitw $TMUX_SESSION_T_ARG \"$SHELL_CMD\"")
+		TMUX_CMDS+=("select-layout $TMUX_SESSION_T_ARG $LAYOUT")
+	fi
+done
+
+TMUX_CMDS+=("set-window-option $TMUX_SESSION_T_ARG synchronize-panes on")
+TMUX_CMDS+=("attach $TMUX_SESSION_T_ARG")
+
+# fix issue with incorrect layout after call to switch-client
+#TMUX_CMDS[${#TMUX_CMDS[@]}]="select-layout $TMUX_SESSION_T_ARG $LAYOUT"
+
+TMPFILE="$(mktemp /tmp/tmux-cluster-XXXXXXXXXXXX)"
+for line in "${TMUX_CMDS[@]}"; do
+	echo "$line" >> "$TMPFILE"
+done
+tmux start-server \; source-file "$TMPFILE"
+rm "$TMPFILE"
