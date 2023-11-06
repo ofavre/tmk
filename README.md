@@ -20,6 +20,7 @@ Tmux options:
     -V              Use even-vertical tmux layout.
 
 Kubectl exec options:
+    --context CTX   Selects the given kubectl context
     -t/+t           Activates/Deactivates stdin as a TTY. (default on)
     -i/+i           Activates/Deactivates stdin forwarding. (default on)
     -n NAMESPACE    The namespace to use.

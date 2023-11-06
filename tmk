@@ -42,6 +42,7 @@ Tmux options:
     -V              Use even-vertical tmux layout.
 
 Kubectl exec options:
+    --context CTX   Selects the given kubectl context
     -t/+t           Activates/Deactivates stdin as a TTY. (default $T_DEFAULT)
     -i/+i           Activates/Deactivates stdin forwarding. (default $I_DEFAULT)
     -n NAMESPACE    The namespace to use.
@@ -61,6 +62,7 @@ EOF
 
 DASHDASH=""
 LAYOUT="tiled"
+KUBECTL_ARGS=()
 COMMAND=()
 T="$T_DEFAULT"
 I="$I_DEFAULT"
@@ -106,6 +108,13 @@ while [ $# -gt 0 ]; do
 			-c)
 				CONTAINER="$2"
 				shift
+				;;
+			--context)
+				KUBECTL_ARGS+=("$1" "$2")
+				shift
+				;;
+			--context=*)
+				KUBECTL_ARGS+=("$1")
 				;;
 			--)
 				DASHDASH=seen
@@ -189,7 +198,7 @@ for pattern_line in "${PODS[@]}"; do
 	POD_PATTERNS+=("$pattern$append")
 done
 
-ELIGIBLE_PODS="$(kubectl get pods $K8S_NAMESPACE_OPT --output=jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+ELIGIBLE_PODS="$(kubectl "${KUBECTL_ARGS[@]}" get pods $K8S_NAMESPACE_OPT --output=jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
 ACTUAL_PODS=()
 for regex_line in "${POD_PATTERNS[@]}"; do
 	regex="${regex_line%/*}"
@@ -217,7 +226,7 @@ for pod_line in "${ACTUAL_PODS[@]}"; do
 		K8S_CONTAINER_OPT=""
 	fi
 	# TODO Escape space in arguments
-	CMDS+=("kubectl exec $K8S_NAMESPACE_OPT $pod $K8S_CONTAINER_OPT $K8S_T_OPT $K8S_I_OPT -- ${COMMAND[*]}")
+	CMDS+=("kubectl "${KUBECTL_ARGS[@]}" exec $K8S_NAMESPACE_OPT $pod $K8S_CONTAINER_OPT $K8S_T_OPT $K8S_I_OPT -- ${COMMAND[*]}")
 done
 
 TMUX_CMDS=()
